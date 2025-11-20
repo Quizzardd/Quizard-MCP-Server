@@ -1,0 +1,6 @@
+fastmcp
+google-auth
+python-dotenv
+requests
+google-cloud-storage
+PyPDF2

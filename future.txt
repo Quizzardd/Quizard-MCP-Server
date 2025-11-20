@@ -1,0 +1,123 @@
+@mcp.tool()
+def check_previous_student_submissions_in_a_module(module_id: str) -> str:
+    """
+    Module performance insights.
+
+    Purpose
+    - Analyze prior student submissions for a specific module to pinpoint topic-level gaps.
+
+    When to use
+    - The educator asks for insights about a specific module's performance.
+    - The educator wants module-targeted assessments.
+
+    Input
+    - module_id: identifier of the module.
+
+    Output
+    - A summary of submissions and observed patterns for the module, highlighting weak areas.
+
+    Notes
+    - Provide actionable guidance such as module-specific weaknesses (e.g., OOP concepts) and suggest remediation.
+    - Use these insights to tailor quiz coverage and difficulty.
+    """
+    return f"Previous submissions checked successfully for module: {module_id}"
+
+    @mcp.tool()
+def set_quiz_preferences(number_of_questions: int, difficulty: str, points_per_question: int = None, dynamic_points: bool = False) -> str:
+    """
+    Set educator quiz preferences.
+
+    Purpose
+    - Capture quiz constraints and scoring rules prior to question generation.
+
+    Inputs
+    - number_of_questions: total number of questions to generate.
+    - difficulty: one of [easy, medium, hard].
+    - points_per_question: fixed points per question when dynamic_points is False.
+    - dynamic_points: if True, points are scaled per question by difficulty.
+
+    Behavior
+    - If neither points_per_question nor dynamic_points is provided, the agent should ask the educator to choose one.
+    - When dynamic_points is True, the agent should scale points (e.g., easy=1, medium=2, hard=3) and compute totalMarks.
+
+    Output
+    - Acknowledgement including the adopted preferences.
+    """
+
+    adopted = {
+        "number_of_questions": number_of_questions,
+        "difficulty": difficulty,
+        "points_per_question": points_per_question,
+        "dynamic_points": dynamic_points,
+    }
+    return f"Quiz preferences set: {adopted}"
+
+@mcp.tool()
+def suggest_quiz_preferences(material_scope: str, insights_summary: str = "") -> str:
+    """
+    Suggest quiz preferences when the educator has not provided them.
+
+    Purpose
+    - Recommend number_of_questions, difficulty, and points strategy based on materials scope and performance insights.
+
+    Inputs
+    - material_scope: "group" or "module" (or comma-separated modules).
+    - insights_summary: optional text summarizing weak areas (e.g., OOP).
+
+    Output
+    - A textual suggestion the agent can present to the educator.
+
+    Notes
+    - The agent should seek confirmation before proceeding with suggested values.
+    """
+
+    return f"Suggested preferences for scope [{material_scope}] with insights [{insights_summary}]"
+
+    
+@mcp.tool()
+def get_the_required_materials_in_a_group(group_id: str) -> str:
+    """
+    Classroom materials fetcher for a group.
+
+    Purpose
+    - Retrieve teaching materials for the specified group to inform quiz creation and lesson planning.
+
+    When to use
+    - The educator wants a quiz based on the entire group's materials.
+    - The educator requests a review of group-level content before generating assessments.
+
+    Input
+    - group_id: identifier of the classroom group.
+
+    Output
+    - A list of URLs or references to required materials available to the group.
+
+    Notes
+    - Use this before generating quizzes intended for group-wide coverage.
+    - Combine with group submissions insights to target weak areas if requested.
+    """
+
+    @mcp.tool()
+def check_previous_student_submissions_in_a_group(group_id: str) -> str:
+    """
+    Group performance insights.
+
+    Purpose
+    - Analyze prior student submissions at the group level to identify strengths and weak areas.
+
+    When to use
+    - The educator asks for insights about group performance.
+    - The educator wants quizzes targeted to group weaknesses.
+
+    Input
+    - group_id: identifier of the classroom group.
+
+    Output
+    - A summary of submissions and observed patterns, including possible weak topics.
+
+    Notes
+    - Provide actionable guidance such as: "Most students are weak in OOP; consider revisiting it in upcoming sessions."
+    - Use these insights to inform question selection and difficulty.
+    """
+    return f"Previous submissions checked successfully for group: {group_id}"
+

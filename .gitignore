@@ -1,0 +1,13 @@
+# Virtual environments and caches
+.venv/
+__pycache__/
+*.pyc
+
+# Local environment variables
+.env
+
+# Service account / credential JSON (keep private)
+nifty-anthem-478010-m9-1dc2480297c8.json
+
+# OS/editor noise
+.DS_Store
