@@ -683,4 +683,6 @@ def add_group_announcement(group_id: str, announcement_details: str, session_id:
 
 # Run server with HTTP transport
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="127.0.0.1", port=9000)
+    # Cloud Run (and similar platforms) inject PORT; default to 9000 for local dev.
+    port = int(os.getenv("PORT", "9000"))
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
