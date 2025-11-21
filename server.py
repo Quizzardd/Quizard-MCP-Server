@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-BACKEND_AUDIENCE = "https://full-snack.obl.ee"
+BACKEND_AUDIENCE = "https://quizard-backend-534916389595.europe-west1.run.app"
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:3000")
 
 AGENT_INSTRUCTIONS = """
@@ -89,8 +89,8 @@ def make_authenticated_request(endpoint: str, method: str, session_id: str, data
     token = get_service_token()
     url = f"{BACKEND_BASE_URL}{endpoint}"
     headers = {
-        "Authorization-Service": f"Bearer {token}",
-        "Authorization": f"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2OTFmNzQyNmRhNTgyNWNiMWFkNmQ5MGQiLCJpYXQiOjE3NjM2NjkwOTUsImV4cCI6MTc2Mzc1NTQ5NX0.hK9NScG9vd05tRMQzBaguAiDF_rr6JE1g3YjXEdYenY",
+        "authentication-service": f"Bearer {token}",
+        "Authorization": f"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2OTIwNWQyNjQ3ZWY5MWZhYzdiMTU1YTEiLCJpYXQiOjE3NjM3MzcyMDYsImV4cCI6MTc2MzgyMzYwNn0.YYlLDa9jb6WBpfWeMhSlXr4phxi5PmfdVNlsyq0X1t0",
         "Session-ID": session_id,
         "Content-Type": "application/json"
     }
