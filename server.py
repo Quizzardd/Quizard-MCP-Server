@@ -1,13 +1,14 @@
 import logging
 import os
+import io
+import asyncio
+import sys
 from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from fastmcp import FastMCP
 import requests
 from google.cloud import storage
-import io
 from PyPDF2 import PdfReader
-import asyncio
-import sys
 from dotenv import load_dotenv
 import google.oauth2.id_token
 from storage_url import parse_storage_url
@@ -60,12 +61,21 @@ Success Checklist
 """
 
 def get_service_token():
-    """Get a fresh Google-signed OIDC Identity Token."""
+    """Get a fresh Google-signed OIDC Identity Token, preferring explicit service account file locally."""
     auth_request = Request()
-    id_token = google.oauth2.id_token.fetch_id_token(
-        auth_request, audience=BACKEND_AUDIENCE
-    )
-    return id_token
+    audience = BACKEND_AUDIENCE
+
+    sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("SERVICE_ACCOUNT_FILE")
+    if sa_path and os.path.exists(sa_path):
+        creds = service_account.IDTokenCredentials.from_service_account_file(
+            sa_path,
+            target_audience=audience,
+        )
+        creds.refresh(auth_request)
+        return creds.token
+
+    # Fallback to metadata server / default credentials (Cloud Run, etc.)
+    return google.oauth2.id_token.fetch_id_token(auth_request, audience=audience)
 
 def make_authenticated_request(endpoint: str, method: str, session_id: str, data: dict = None):
     """
