@@ -23,8 +23,8 @@ logging.basicConfig(level=logging.INFO)
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-BACKEND_AUDIENCE = "https://quizard-backend-534916389595.europe-west1.run.app"
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:3000")
+BACKEND_AUDIENCE = BACKEND_BASE_URL  # Audience for OIDC token
 
 AGENT_INSTRUCTIONS = """
 Context & Authentication
