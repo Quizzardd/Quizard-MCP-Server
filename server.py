@@ -90,8 +90,7 @@ def make_authenticated_request(endpoint: str, method: str, session_id: str, data
     url = f"{BACKEND_BASE_URL}{endpoint}"
     headers = {
         "authentication-service": f"Bearer {token}",
-        "Authorization": f"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2OTIwNWQyNjQ3ZWY5MWZhYzdiMTU1YTEiLCJpYXQiOjE3NjM3MzcyMDYsImV4cCI6MTc2MzgyMzYwNn0.YYlLDa9jb6WBpfWeMhSlXr4phxi5PmfdVNlsyq0X1t0",
-        "Session-ID": session_id,
+        "session-id": session_id,
         "Content-Type": "application/json"
     }
     
