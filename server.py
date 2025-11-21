@@ -28,40 +28,34 @@ BACKEND_AUDIENCE = BACKEND_BASE_URL  # Audience for OIDC token
 
 AGENT_INSTRUCTIONS = """
 Context & Authentication
-- sessionId always arrives via <prompt_context>. Never ask for it and pass it to every MCP parameter named session_id.
-- group_id, module IDs, selected_modules, educator_name, group_name, and timezone/locale also arrive via context. If anything crucial is missing, send the standard error message and stop instead of requesting IDs.
+- sessionId arrives via <prompt_context>; never ask for it and always pass it to tools as session_id.
+- group_id, module IDs, selected_modules, educator_name, group_name, and timezone/locale also come from context. If anything critical is missing, send the standard error message and stop instead of requesting IDs.
 
-First Response & Flow
-- Greet the educator (use their name when available) and mention the module names detected.
-- Outline the quiz-building plan: materials -> requirements -> draft -> preview -> submit -> announce.
-- Make it clear you already have the necessary context data; never ask them to paste JSON.
+Primary Flow
+1. Material sync: call get_the_required_materials_in_a_module for every module, then read_content_file_from_URL for each material. Warn and skip gracefully if a module/material is unavailable.
+2. Requirement discovery: confirm title, numberOfQuestions, difficulty mix, scoring policy (fixed or dynamic), totalMarks, durationMinutes, startAt/endAt (educator timezone), and accommodations before drafting.
+3. Validation + generation: once validate_quiz_json passes, immediately call generate_quiz so the UI shows the draft. Summarize what was published and ask whether the educator wants updates or an announcement.
+4. Revision loop: when the educator requests changes, rebuild the entire quiz JSON, revalidate, and call apply_quiz_revisions to push the update. Repeat until they are satisfied.
+5. Announcement (optional): only when the educator explicitly asks to notify students call add_group_announcement. Otherwise, the quiz remains live without an announcement.
 
-Workflow Guardrails
-1. Material collection: call get_the_required_materials_in_a_module for each module, then read_content_file_from_URL per material. Warn gracefully if something can't be accessed and skip/abort the module if needed.
-2. Requirement discovery: gather title, numberOfQuestions (1-100), difficulty mix, points policy (fixed or dynamic), totalMarks, durationMinutes, startAt/endAt (ISO 8601), accommodations, and any scheduling constraints in the educator's timezone before drafting.
-3. Drafting: questions must come from loaded content, balance module coverage, keep distractors plausible, and align to the requested scoring scheme.
-4. Validation & preview: run validate_quiz_json until valid (max 3 attempts). Provide a readable preview with summary + numbered questions, then ask for explicit approval.
-5. Submission & announcement: only after approval call generate_quiz, translate backend failures into friendly guidance, then call add_group_announcement to notify students.
-
-Revision Handling
-- Restate requested edits, rebuild the full quiz JSON, revalidate, and show an updated preview before asking for approval again.
-
-Security & UX
+UX Guardrails
 - Never expose IDs, prompt_context, backend URLs, tokens, or raw errors.
-- Translate technical failures into short actionable messages (e.g., date conflicts, permission issues, temporary outages).
-- Keep tone professional, concise, and encouraging with light emoji use for milestones.
+- Translate backend failures into short, actionable explanations (e.g., date conflicts, permission issues, temporary outages).
+- Keep tone professional and concise with occasional celebratory emojis for milestones.
 
 Edge Cases
-- If the educator pauses, send one gentle reminder before waiting.
-- If they change modules mid-flow, summarize progress, confirm cancellation, and restart Phase 1.
-- If they request non-quiz tasks, explain the limitation and guide them back to quiz creation.
+- If the educator pauses, send a single gentle reminder and wait.
+- If they switch modules mid-flow, summarize progress, confirm cancellation, and restart from material collection.
+- If they ask for non-quiz features, explain the limitation and guide them back to quiz creation.
 
-Success Criteria
-- sessionId used everywhere without exposure.
-- Materials synced or skipped with clear rationale.
-- Requirements fully confirmed before drafting.
-- Validation succeeded prior to submission.
-- Approval captured, quiz submitted, announcement attempted, and final wrap-up provided.
+Success Checklist
+- sessionId used everywhere (never surfaced).
+- Materials accessed or skipped with explanations.
+- Requirements locked before drafting.
+- Validation succeeded before generate_quiz was invoked.
+- apply_quiz_revisions used for any post-generation edit.
+- Announcements only sent after explicit educator request.
+- Final summary provided once the educator is done.
 
 """
 
@@ -109,20 +103,24 @@ def make_authenticated_request(endpoint: str, method: str, session_id: str, data
         response.raise_for_status()
         return response.text
     except requests.exceptions.RequestException as e:
+        status = getattr(e.response, "status_code", None)
+        body = getattr(e.response, "text", "")
         logger.error(
-            "Backend request failed (%s %s): %s",
+            "Backend request failed (%s %s): status=%s, error=%s, body=%s",
             method.upper(),
             endpoint,
+            status,
             e,
+            body,
             exc_info=True,
         )
-        return json.dumps(
-            {
-                "success": False,
-                "error_code": "BACKEND_REQUEST_FAILED",
-                "message": "Unable to reach the classroom service right now. Please try again shortly.",
-            }
-        )
+        return json.dumps({
+            "success": False,
+            "error_code": "BACKEND_REQUEST_FAILED",
+            "status": status,
+            "message": "Request to classroom service failed.",
+            "details": body[:1000] if body else str(e),
+        })
 
 # Create MCP server with explicit agent instructions
 mcp = FastMCP("Classroom Quiz Generator MCP Server", instructions=AGENT_INSTRUCTIONS)
@@ -240,444 +238,379 @@ def read_content_file_from_URL(file_url: str, session_id: str) -> str:
         return f"Error reading file: {str(e)}"
 
 
-@mcp.tool()
-def validate_quiz_json(quiz_json: str, session_id: str) -> str:
-    """
-    Validate quiz JSON against strict schema requirements before submission.
+# @mcp.tool()
+# def validate_quiz_json(quiz_json: str, session_id: str) -> str:
+#     """
+#     Validate quiz JSON against strict schema requirements before submission.
     
-    Purpose:
-        Ensure quiz JSON is properly formatted and contains all required fields
-        before calling generate_quiz. Prevents database errors and ensures
-        data integrity.
+#     Purpose:
+#         Ensure quiz JSON is properly formatted and contains all required fields
+#         before calling generate_quiz. Prevents database errors and ensures
+#         data integrity.
     
-    When to use:
-        - ALWAYS call before showing preview to educator
-        - After drafting quiz questions and metadata
-        - After any modifications to quiz_json
-        - REQUIRED before generate_quiz can be called
+#     When to use:
+#         - ALWAYS call before showing preview to educator
+#         - After drafting quiz questions and metadata
+#         - After any modifications to quiz_json
+#         - REQUIRED before generate_quiz can be called
     
-    Input:
-        quiz_json: Complete quiz object as JSON string with structure:
-        {
-            "title": "Quiz Title",
-            "description": "Optional description",
-            "totalMarks": 100,
-            "durationMinutes": 60,
-            "startAt": "2024-12-01T10:00:00Z",
-            "endAt": "2024-12-10T23:59:59Z",
-            "questions": [
-                {
-                    "text": "What is OOP?",
-                    "options": ["A", "B", "C", "D"],
-                    "correctOptionIndex": 0,
-                    "point": 5
-                }
-            ]
-        }
-        session_id: Current session ID from prompt context (sessionId)
-                    REQUIRED for authentication; extract from prompt context,
-                    never ask educator to provide it
+#     Input:
+#     {
+#         quiz_json: Complete payload as JSON string with structure:
+#         {
+#             "quiz_details": {
+#                 "title": "Quiz Title",
+#                 "description": "Optional description",
+#                 "totalMarks": 100,
+#                 "durationMinutes": 60,
+#                 "startAt": "2024-12-01T10:00:00Z",
+#                 "endAt": "2024-12-10T23:59:59Z",
+#                 "questions": [
+#                     {
+#                         "text": "What is OOP?",
+#                         "options": ["A", "B", "C", "D"],
+#                         "correctOptionIndex": 0,
+#                         "point": 5
+#                     }
+#                 ],
+#                 "module_ids": ["..."]
+#             },
+#             "session_id": "<sessionId from prompt context>"
+#         }
+#     }
     
-    Output:
-        JSON string containing validation result:
-        {
-            "valid": true/false,
-            "errors": [
-                "questions[2].correctOptionIndex (5) exceeds options length (4)",
-                "totalMarks (95) does not match sum of question points (100)"
-            ],
-            "warnings": [
-                "description is empty",
-                "question 3 has only 2 options (consider 4+ for better assessment)"
-            ]
-        }
+#     Output:
+#         JSON string containing validation result:
+#         {
+#             "valid": true/false,
+#             "errors": [
+#                 "questions[2].correctOptionIndex (5) exceeds options length (4)",
+#                 "totalMarks (95) does not match sum of question points (100)"
+#             ],
+#             "warnings": [
+#                 "description is empty",
+#                 "question 3 has only 2 options (consider 4+ for better assessment)"
+#             ]
+#         }
     
-    Validation rules:
-        Required fields:
-            - title (non-empty string)
-            - totalMarks (positive number)
-            - durationMinutes (positive number)
-            - startAt (ISO 8601 datetime string)
-            - endAt (ISO 8601 datetime string)
-            - questions (non-empty array)
+#     Validation rules:
+#         Required fields:
+#             - title (non-empty string)
+#             - totalMarks (positive number)
+#             - durationMinutes (positive number)
+#             - startAt (ISO 8601 datetime string)
+#             - endAt (ISO 8601 datetime string)
+#             - questions (non-empty array)
         
-        Question requirements:
-            - text (non-empty string)
-            - options (array with 2+ strings, recommend 4)
-            - correctOptionIndex (valid index in options array: 0 to options.length-1)
-            - point (positive number, default 1)
+#         Question requirements:
+#             - text (non-empty string)
+#             - options (array with 2+ strings, recommend 4)
+#             - correctOptionIndex (valid index in options array: 0 to options.length-1)
+#             - point (positive number, default 1)
         
-        Logic checks:
-            - startAt must be before endAt
-            - Sum of question points should equal totalMarks
-            - No duplicate question text
-            - Options should be non-empty strings
-            - Each question must have at least 2 options
+#         Logic checks:
+#             - startAt must be before endAt
+#             - Sum of question points should equal totalMarks
+#             - No duplicate question text
+#             - Options should be non-empty strings
+#             - Each question must have at least 2 options
     
-    Next steps after calling:
-        - If valid: true → show preview to educator
-        - If valid: false → fix errors and revalidate
-        - Never show preview or call generate_quiz if validation fails
+#     Next steps after calling:
+#         - If valid: true → show preview to educator
+#         - If valid: false → fix errors and revalidate
+#         - Never show preview or call generate_quiz if validation fails
     
-    Notes:
-        - Validation is strict; all errors must be fixed
-        - Warnings are suggestions; quiz can proceed with warnings
-        - ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or with timezone offset
-    """
-    try:
-        data = json.loads(quiz_json)
-        errors = []
-        warnings = []
+#     Notes:
+#         - Validation is strict; all errors must be fixed
+#         - Warnings are suggestions; quiz can proceed with warnings
+#         - ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or with timezone offset
+#     """
+#     try:
+#         payload_in = json.loads(quiz_json)
+#         errors = []
+#         warnings = []
+
+#         if not isinstance(payload_in, dict):
+#             return json.dumps({
+#                 "valid": False,
+#                 "errors": ["Payload must be a JSON object containing quiz_details"],
+#                 "warnings": []
+#             })
+
+#         if "quiz_details" not in payload_in:
+#             return json.dumps({
+#                 "valid": False,
+#                 "errors": ["Missing quiz_details object in payload"],
+#                 "warnings": []
+#             })
+
+#         data = payload_in.get("quiz_details")
+#         if not isinstance(data, dict):
+#             return json.dumps({
+#                 "valid": False,
+#                 "errors": ["quiz_details must be an object"],
+#                 "warnings": []
+#             })
         
-        # Required field validation
-        if not data.get("title") or not data["title"].strip():
-            errors.append("title is required and cannot be empty")
+#         # Required field validation
+#         if not data.get("title") or not data["title"].strip():
+#             errors.append("title is required and cannot be empty")
         
-        if not isinstance(data.get("totalMarks"), (int, float)) or data.get("totalMarks", 0) <= 0:
-            errors.append("totalMarks must be a positive number")
+#         if not isinstance(data.get("totalMarks"), (int, float)) or data.get("totalMarks", 0) <= 0:
+#             errors.append("totalMarks must be a positive number")
         
-        if not isinstance(data.get("durationMinutes"), (int, float)) or data.get("durationMinutes", 0) <= 0:
-            errors.append("durationMinutes must be a positive number")
+#         if not isinstance(data.get("durationMinutes"), (int, float)) or data.get("durationMinutes", 0) <= 0:
+#             errors.append("durationMinutes must be a positive number")
         
-        if not data.get("startAt"):
-            errors.append("startAt is required")
+#         if not data.get("startAt"):
+#             errors.append("startAt is required")
         
-        if not data.get("endAt"):
-            errors.append("endAt is required")
+#         if not data.get("endAt"):
+#             errors.append("endAt is required")
         
-        # Questions validation
-        questions = data.get("questions", [])
-        if not questions or len(questions) == 0:
-            errors.append("questions array cannot be empty")
-        else:
-            total_points = 0
-            question_texts = set()
+#         # Questions validation
+#         questions = data.get("questions", [])
+#         if not questions or len(questions) == 0:
+#             errors.append("questions array cannot be empty")
+#         else:
+#             total_points = 0
+#             question_texts = set()
             
-            for idx, question in enumerate(questions):
-                # Question text
-                if not question.get("text") or not question["text"].strip():
-                    errors.append(f"questions[{idx}].text is required and cannot be empty")
-                elif question["text"] in question_texts:
-                    errors.append(f"questions[{idx}].text is duplicate")
-                else:
-                    question_texts.add(question["text"])
+#             for idx, question in enumerate(questions):
+#                 # Question text
+#                 if not question.get("text") or not question["text"].strip():
+#                     errors.append(f"questions[{idx}].text is required and cannot be empty")
+#                 elif question["text"] in question_texts:
+#                     errors.append(f"questions[{idx}].text is duplicate")
+#                 else:
+#                     question_texts.add(question["text"])
                 
-                # Options
-                options = question.get("options", [])
-                if not isinstance(options, list) or len(options) < 2:
-                    errors.append(f"questions[{idx}].options must have at least 2 options")
-                elif len(options) < 4:
-                    warnings.append(f"questions[{idx}] has only {len(options)} options (4 recommended)")
+#                 # Options
+#                 options = question.get("options", [])
+#                 if not isinstance(options, list) or len(options) < 2:
+#                     errors.append(f"questions[{idx}].options must have at least 2 options")
+#                 elif len(options) < 4:
+#                     warnings.append(f"questions[{idx}] has only {len(options)} options (4 recommended)")
                 
-                # Check for empty options
-                for opt_idx, option in enumerate(options):
-                    if not option or not str(option).strip():
-                        errors.append(f"questions[{idx}].options[{opt_idx}] cannot be empty")
+#                 # Check for empty options
+#                 for opt_idx, option in enumerate(options):
+#                     if not option or not str(option).strip():
+#                         errors.append(f"questions[{idx}].options[{opt_idx}] cannot be empty")
                 
-                # Correct option index
-                correct_idx = question.get("correctOptionIndex")
-                if not isinstance(correct_idx, int):
-                    errors.append(f"questions[{idx}].correctOptionIndex must be a number")
-                elif correct_idx < 0 or correct_idx >= len(options):
-                    errors.append(f"questions[{idx}].correctOptionIndex ({correct_idx}) is out of bounds for {len(options)} options")
+#                 # Correct option index
+#                 correct_idx = question.get("correctOptionIndex")
+#                 if not isinstance(correct_idx, int):
+#                     errors.append(f"questions[{idx}].correctOptionIndex must be a number")
+#                 elif correct_idx < 0 or correct_idx >= len(options):
+#                     errors.append(f"questions[{idx}].correctOptionIndex ({correct_idx}) is out of bounds for {len(options)} options")
                 
-                # Points
-                points = question.get("point", 1)
-                if not isinstance(points, (int, float)) or points <= 0:
-                    errors.append(f"questions[{idx}].point must be a positive number")
-                else:
-                    total_points += points
+#                 # Points
+#                 points = question.get("point", 1)
+#                 if not isinstance(points, (int, float)) or points <= 0:
+#                     errors.append(f"questions[{idx}].point must be a positive number")
+#                 else:
+#                     total_points += points
             
-            # Total marks validation
-            if data.get("totalMarks") and abs(total_points - data["totalMarks"]) > 0.01:
-                errors.append(f"Sum of question points ({total_points}) does not match totalMarks ({data['totalMarks']})")
+#             # Total marks validation
+#             if data.get("totalMarks") and abs(total_points - data["totalMarks"]) > 0.01:
+#                 errors.append(f"Sum of question points ({total_points}) does not match totalMarks ({data['totalMarks']})")
         
-        # Date validation
-        if data.get("startAt") and data.get("endAt"):
-            try:
-                from datetime import datetime
-                start = datetime.fromisoformat(data["startAt"].replace('Z', '+00:00'))
-                end = datetime.fromisoformat(data["endAt"].replace('Z', '+00:00'))
-                if start >= end:
-                    errors.append("startAt must be before endAt")
-            except ValueError as e:
-                errors.append(f"Invalid date format: {str(e)}")
+#         # Date validation
+#         if data.get("startAt") and data.get("endAt"):
+#             try:
+#                 from datetime import datetime
+#                 start = datetime.fromisoformat(data["startAt"].replace('Z', '+00:00'))
+#                 end = datetime.fromisoformat(data["endAt"].replace('Z', '+00:00'))
+#                 if start >= end:
+#                     errors.append("startAt must be before endAt")
+#             except ValueError as e:
+#                 errors.append(f"Invalid date format: {str(e)}")
         
-        # Optional warnings
-        if not data.get("description") or not data["description"].strip():
-            warnings.append("description is empty (recommended to add context for students)")
+#         # Optional warnings
+#         if not data.get("description") or not data["description"].strip():
+#             warnings.append("description is empty (recommended to add context for students)")
         
-        return json.dumps({
-            "valid": len(errors) == 0,
-            "errors": errors,
-            "warnings": warnings
-        })
+#         return json.dumps({
+#             "valid": len(errors) == 0,
+#             "errors": errors,
+#             "warnings": warnings
+#         })
         
-    except json.JSONDecodeError as e:
-        return json.dumps({
-            "valid": False,
-            "errors": [f"Invalid JSON format: {str(e)}"],
-            "warnings": []
-        })
-    except Exception as e:
-        return json.dumps({
-            "valid": False,
-            "errors": [f"Validation error: {str(e)}"],
-            "warnings": []
-        })
+#     except json.JSONDecodeError as e:
+#         return json.dumps({
+#             "valid": False,
+#             "errors": [f"Invalid JSON format: {str(e)}"],
+#             "warnings": []
+#         })
+#     except Exception as e:
+#         return json.dumps({
+#             "valid": False,
+#             "errors": [f"Validation error: {str(e)}"],
+#             "warnings": []
+#         })
 
 
 @mcp.tool()
 def generate_quiz(quiz_details: str, session_id: str) -> str:
     """
-    Submit finalized quiz to database and make it available to students.
-    
-    ⚠️ CRITICAL: This tool pushes data to production database. Only call after:
-        1. validate_quiz_json returns valid: true
-        2. Educator has reviewed complete preview
-        3. Educator explicitly confirms submission with words like:
-           "submit", "create the quiz", "looks good", "approve", "go ahead"
-    
-    Purpose:
-        Persist quiz to database, associate with modules, and make available
-        for students to take within the specified time window.
-    
-    When to use:
-        - ONLY after educator explicitly approves preview
-        - NEVER call during preview generation or revision
-        - NEVER call before validation passes
-        - NEVER call "just to show" or "as an example"
-    
-    Input:
-        { "quiz_details":
-            {
-            "title": "Midterm Exam - OOP & Data Structures",
-            "description": "Covers chapters 3-5",
-            "totalMarks": 100,
-            "durationMinutes": 90,
-            "startAt": "2024-12-15T09:00:00Z",
-            "endAt": "2024-12-15T12:00:00Z",
-            "questions": [
-                {
-                    "text": "Explain encapsulation",
-                    "options": ["A...", "B...", "C...", "D..."],
-                    "correctOptionIndex": 2,
-                    "point": 5
-                },
-               {
-                    "text": "Explain OOP",
-                    "options": ["A...", "B...", "C...", "D..."],
-                    "correctOptionIndex": 2,
-                    "point": 5
-                }
+Persist the validated quiz so it appears in the educator UI.
 
-            ],
-            "module_ids": ["691f74c7da5825cb1ad6d921", "691f74a0da5825cb1ad6d91d"]
-             }
-        "session_id": Current session ID from prompt context (sessionId)
-                    REQUIRED for authentication; extract from prompt context,
-                    never ask educator to provide it
-        }
-        
-    
-    Output:
-        JSON string containing creation result:
-        {
-                "success": true,
-                "message": "Quiz created successfully",
-                "data": {
-                    "_id": "691f7fc730dcb62ec768f3aa",
-                    "title": "Midterm Exam - OOP & Data Structures",
-                    "description": "Covers chapters 3-5",
-                    "questions": [
-                    {
-                        "_id": "691f7fc730dcb62ec768f3a7",
-                        "text": "Explain encapsulation",
-                        "options": [
-                        "A...",
-                        "B...",
-                        "C...",
-                        "D..."
-                        ],
-                        "correctOptionIndex": 2,
-                        "point": 5,
-                        "__v": 0
-                    },
-                    {
-                        "_id": "691f7fc730dcb62ec768f3a8",
-                        "text": "Explain OOP",
-                        "options": [
-                        "A...",
-                        "B...",
-                        "C...",
-                        "D..."
-                        ],
-                        "correctOptionIndex": 2,
-                        "point": 5,
-                        "__v": 0
-                    }
-                    ],
-                    "totalMarks": 100,
-                    "durationMinutes": 90,
-                    "startAt": "2024-12-15T09:00:00.000Z",
-                    "endAt": "2024-12-15T12:00:00.000Z",
-                    "createdAt": "2025-11-20T20:53:27.666Z",
-                    "updatedAt": "2025-11-20T20:53:27.666Z",
-                    "__v": 0
-                 }
-}
-        
-        OR on error:
-        {
-            "success": false,
-            "error": "Description of what went wrong",
-            "details": "Additional technical details if available"
-        }
-    
-    Backend operations:
-        1. Validates user has permission to create quiz in target modules
-        2. Creates individual Question documents in database
-        3. Creates Quiz document with references to questions
-        4. Links quiz to specified modules (updates module.quizzes array)
-        5. Makes quiz discoverable to students in group
-    
-    Next steps after calling:
-        1. Check success field; if false, explain error to educator
-        2. If success, parse quiz_id and module names from response
-        3. Confirm success to educator with human-readable message
-        4. Call add_group_announcement to notify students
-        5. DO NOT expose quiz_id or module_ids to educator
-    
-    Error handling:
-        - If success: false, explain error to educator and suggest fixes
-        - Common errors: 
-          - Invalid dates (startAt after endAt)
-          - Missing required fields
-          - Module access denied
-          - Database timeout/connection issues
-        - On error, quiz is NOT created; safe to retry after fixes
-    
-    Notes:
-        - This is a write operation; cannot be undone via MCP
-        - Quiz becomes immediately visible to students at startAt time
-        - Educator can modify quiz later through platform UI
-        - DO NOT call this tool multiple times for same quiz
-        - session_id is used to set quiz author and verify permissions
-        - Authentication relies on session_id; userId will not be present in prompt context
-    """
+Flow expectations:
+    1. Finish requirement gathering and run validate_quiz_json.
+    2. As soon as validation returns valid: true, call generate_quiz so the
+       initial draft is stored and rendered. No extra educator approval prompt
+       is required at this moment.
+    3. Capture quiz_id, modules_linked, available_from, and available_until for
+       future revision/announcement steps (never expose IDs to the educator).
+
+When to use:
+    - Immediately after validation passes for a brand-new quiz configuration.
+    - Never for incremental edits (use apply_quiz_revisions in that case).
+
+Input structure:
+    "{
+      "quiz_details": {
+        "title": "...",
+        "description": "...",
+        "totalMarks": 100,
+        "durationMinutes": 90,
+        "startAt": "2024-12-15T09:00:00Z",
+        "endAt": "2024-12-15T12:00:00Z",
+        "module_ids": ["mod_abc", "mod_xyz"],
+        "questions": [
+          {"text": "...", "options": ["A","B","C","D"], "correctOptionIndex": 1, "point": 5},
+          {"text": "...", "options": ["A","B","C","D"], "correctOptionIndex": 2, "point": 5}
+        ]
+      },
+      "session_id": "<sessionId from prompt context>"
+    }"
+
+Response format:
+    {
+      "success": true,
+      "quiz_id": "quiz_123",
+      "modules_linked": ["Object-Oriented Programming"],
+      "available_from": "Dec 15, 2024 at 9:00 AM",
+      "available_until": "Dec 15, 2024 at 12:00 PM",
+      "message": "Quiz created successfully"
+    }
+
+Next steps when success=true:
+    - Relay human-friendly details (title, duration, marks, availability).
+    - Store quiz_id privately for apply_quiz_revisions.
+    - Ask the educator whether they want more updates or prefer to notify students.
+
+Error handling:
+    - On success=false, explain the high-level cause (date conflict, permissions,
+      backend timeout, etc.) and offer to retry after adjustments.
+    - No quiz is created when the call fails, so it is safe to call again once
+      the issue is resolved.
+"""
     endpoint = "/api/v1/quizzes/from-details"
     return make_authenticated_request(endpoint, "POST", session_id, json.loads(quiz_details))
 
 
 @mcp.tool()
+def apply_quiz_revisions(quiz_id: str, updated_quiz_details: str, session_id: str) -> str:
+    """
+    Apply educator-requested updates to an existing quiz draft.
+
+    Usage:
+        1. Gather the requested changes and rebuild the full quiz JSON.
+        2. Run validate_quiz_json again and ensure it is still valid.
+        3. Call apply_quiz_revisions so the backend/UI reflect the edits.
+
+    Args:
+        quiz_id: Identifier returned from generate_quiz (keep private).
+        updated_quiz_details: Stringified JSON with structure:
+            "{
+              "quiz_details": { ...same schema as generate_quiz... },
+              "session_id": "<sessionId from prompt context>"
+            }"
+        session_id: Session identifier from prompt context for auth.
+
+    Behavior:
+        - Issues a PUT to /api/v1/quizzes/{quiz_id} with the new payload.
+        - Returns { "success": bool, "message": "...", "quiz": {...} } on success.
+        - On failure, includes error/details strings to translate for the educator.
+    """
+
+    endpoint = f"/api/v1/quizzes/from-details/{quiz_id}"
+    return make_authenticated_request(endpoint, "PUT", session_id, json.loads(updated_quiz_details))
+
+
+@mcp.tool()
 def add_group_announcement(group_id: str, announcement_details: str, session_id: str) -> str:
     """
-    Post an announcement to group feed notifying students of new quiz.
-    
-    Purpose:
-        Alert all students in group that a new quiz is available, with
-        key details like title, deadline, duration, and marks.
-    
-    When to use:
-        - IMMEDIATELY after successful generate_quiz call
-        - Once per quiz creation
-        - Only if generate_quiz returned success: true
-    
-    Input:
-        group_id: Internal group identifier from prompt context
-                  (NEVER ask educator; provided automatically)
-        
-        announcement_details: JSON string with structure:
+    Post an announcement to the group feed when the educator explicitly asks to notify students.
+
+Purpose:
+    Share quiz availability details (duration, marks, window, covered modules) with all students.
+
+When to use:
+    - Only after generate_quiz/apply_quiz_revisions succeeded and the educator says to announce.
+    - Once per quiz launch (retry only if a prior attempt failed).
+
+Input:
+    group_id: Provided via prompt context (never ask the educator).
+    announcement_details: JSON string such as:
         {
-            "text": "A new quiz 'Midterm Exam - OOP & Data Structures' is now available.\n\nDetails:\n- Duration: 90 minutes\n- Total Marks: 100\n- Available: Dec 15, 2024 at 9:00 AM\n- Deadline: Dec 15, 2024 at 12:00 PM\n\nTopics covered: OOP Fundamentals, Data Structures\n\nGood luck!",
-            "quiz_id": "quiz_xyz789"
+          "text": "A new quiz 'Midterm Exam' is now available...",
+          "quiz_id": "quiz_123"
         }
-        
-        session_id: Current session ID from prompt context (sessionId)
-                    REQUIRED for authentication; extract from prompt context,
-                    never ask educator to provide it
-                    This will be used to authorize the announcement author
-    
-    Output:
-        JSON string containing announcement result:
-        {
-            "success": true,
-            "announcement_id": "ann_abc123",
-            "message": "Announcement posted successfully",
-            "notified_students": 45
-        }
-        
-        OR on error:
-        {
-            "success": false,
-            "error": "Failed to post announcement",
-            "details": "Additional error information"
-        }
-    
-    Announcement text template:
-        "A new quiz '{quiz_title}' is now available.
-        
-        Details:
-        - Duration: {durationMinutes} minutes
-        - Total Marks: {totalMarks}
-        - Available: {startAt formatted human-readable}
-        - Deadline: {endAt formatted human-readable}
-        
-        Topics covered: {module_names joined with commas}
-        
-        Good luck!"
-    
-    Backend operations:
-        1. Validates user has permission to post to group
-        2. Creates Announcement document with:
-           - author: resolved from session_id (educator who created quiz)
-           - text: announcement message
-           - quiz: quiz_id reference
-           - group: group_id reference
-        3. Notifies all students in group (via notifications service)
-        4. Returns count of students notified
-    
-    Next steps after calling:
-        1. Check success field; if false, warn educator but confirm quiz exists
-        2. If success, confirm to educator that students have been notified
-        3. Provide summary: "Quiz created and {notified_students} students notified"
-        4. DO NOT expose announcement_id, quiz_id, or group_id to educator
-    
+    session_id: Prompt-context session for authentication.
+
+Output:
+    {
+      "success": true,
+      "announcement_id": "ann_456",
+      "notified_students": 42
+    }
+    or
+    {
+      "success": false,
+      "error": "...",
+      "details": "..."
+    }
+
     Notes:
-        - Announcements are immediately visible in group feed
-        - Students may receive push notifications depending on their settings
-        - If announcement fails, quiz is still created and accessible
-        - DO NOT expose group_id or internal IDs to educator
-        - session_id is used as announcement author for proper attribution
-        - Authentication relies on session_id; userId will not be present in prompt context
+        - The quiz is already live once generate_quiz/apply_quiz_revisions returns success; this call only handles notifications.
+        - If it fails, reassure the educator that the quiz remains accessible and offer manual announcement options.
+        - Announcement schema: author (ObjectId, from session), text (required), quiz (optional ObjectId), group (required ObjectId).
     """
-    # try:
-    #     details = json.loads(announcement_details)
-        
-    #     # Build request payload matching backend schema
-    #     payload = {
-    #         "text": details.get("text"),
-    #         "quiz": details.get("quiz_id"),
-    #         "group": group_id
-    #         # author will be resolved from session linked to Session-ID header
-    #     }
-        
-    #     endpoint = f"/api/v1/announcements/create"
-    #     return make_authenticated_request(endpoint, "POST", session_id, payload)
-        
-    # except json.JSONDecodeError as e:
-    #     return json.dumps({
-    #         "success": False,
-    #         "error": "Invalid announcement details format",
-    #         "details": str(e)
-    #     })
-    # except Exception as e:
-    #     return json.dumps({
-    #         "success": False,
-    #         "error": "Failed to create announcement",
-    #         "details": str(e)
-    #     })
-    return "You are in testing mode right now, simulate that the announment is send successfully and continue working"
+    try:
+        details = json.loads(announcement_details)
+    except json.JSONDecodeError as e:
+        return json.dumps({
+            "success": False,
+            "error": "Invalid announcement details format",
+            "details": str(e)
+        })
+
+    text = details.get("text")
+    if not text or not str(text).strip():
+        return json.dumps({
+            "success": False,
+            "error": "Announcement text is required"
+        })
+
+    payload = {
+        "text": text,
+        "group": group_id  # author is resolved from the session linked to Session-ID header
+    }
+
+    if details.get("quiz_id"):
+        payload["quiz"] = details["quiz_id"]
+
+    try:
+        endpoint = "/api/v1/announcements"
+        return make_authenticated_request(endpoint, "POST", session_id, payload)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": "Failed to create announcement",
+            "details": str(e)
+        })
 
 
 # Run server with HTTP transport
@@ -685,3 +618,4 @@ if __name__ == "__main__":
     # Cloud Run (and similar platforms) inject PORT; default to 9000 for local dev.
     port = int(os.getenv("PORT", "9000"))
     mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    #mcp.run(transport="streamable-http", host="127.0.0.1", port=port)
