@@ -3,6 +3,8 @@ import os
 import io
 import asyncio
 import sys
+from typing import List, Dict, Any, Optional
+from datetime import datetime
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from fastmcp import FastMCP
@@ -34,9 +36,9 @@ Context & Authentication
 
 Primary Flow
 1. Material sync: call get_the_required_materials_in_a_module for every module, then read_content_file_from_URL for each material. Warn and skip gracefully if a module/material is unavailable.
-2. Requirement discovery: confirm title, numberOfQuestions, difficulty mix, scoring policy (fixed or dynamic), totalMarks, durationMinutes, startAt/endAt (educator timezone), and accommodations before drafting.
-3. Validation + generation: once validate_quiz_json passes, immediately call generate_quiz so the UI shows the draft. Summarize what was published and ask whether the educator wants updates or an announcement.
-4. Revision loop: when the educator requests changes, rebuild the entire quiz JSON, revalidate, and call apply_quiz_revisions to push the update. Repeat until they are satisfied.
+2. Requirement discovery: confirm title, numberOfQuestions, difficulty mix, scoring policy (fixed or dynamic), totalMarks, durationMinutes, startAt/endAt (educator timezone).
+3. Generation: once requirements are gathered, call generate_quiz with structured parameters (title, total_marks, duration_minutes, start_at, end_at, questions array, module_ids). The function validates internally. Summarize what was published and ask whether the educator wants updates or an announcement.
+4. Revision loop: when the educator requests changes, call apply_quiz_revisions with all parameters (quiz_id and updated values). The function handles validation. Repeat until they are satisfied.
 5. Announcement (optional): only when the educator explicitly asks to notify students call add_group_announcement. Otherwise, the quiz remains live without an announcement.
 
 UX Guardrails
@@ -53,8 +55,9 @@ Success Checklist
 - sessionId used everywhere (never surfaced).
 - Materials accessed or skipped with explanations.
 - Requirements locked before drafting.
-- Validation succeeded before generate_quiz was invoked.
-- apply_quiz_revisions used for any post-generation edit.
+- generate_quiz called with all required parameters (title, total_marks, duration_minutes, start_at, end_at, questions, module_ids).
+- Questions array properly structured with text, options, correctOptionIndex, and point for each question.
+- apply_quiz_revisions used for any post-generation edit with all parameters.
 - Announcements only sent after explicit educator request.
 - Final summary provided once the educator is done.
 
@@ -131,6 +134,73 @@ def make_authenticated_request(endpoint: str, method: str, session_id: str, data
             "message": "Request to classroom service failed.",
             "details": body[:1000] if body else str(e),
         })
+
+def validate_quiz_parameters(
+    title: str,
+    total_marks: float,
+    duration_minutes: int,
+    start_at: str,
+    end_at: str,
+    questions: List[Dict[str, Any]],
+    module_ids: List[str]
+) -> Dict[str, Any]:
+    """Validate quiz parameters before API submission."""
+    errors = []
+    
+    # Title validation
+    if not title or not title.strip():
+        errors.append("Title cannot be empty")
+    
+    # Marks validation
+    if total_marks <= 0:
+        errors.append("Total marks must be positive")
+    
+    # Duration validation
+    if duration_minutes <= 0:
+        errors.append("Duration must be positive")
+    
+    # Date validation
+    try:
+        start = datetime.fromisoformat(start_at.replace('Z', '+00:00'))
+        end = datetime.fromisoformat(end_at.replace('Z', '+00:00'))
+        if start >= end:
+            errors.append("Start time must be before end time")
+    except ValueError as e:
+        errors.append(f"Invalid date format: {str(e)}")
+    
+    # Questions validation
+    if not questions:
+        errors.append("At least one question is required")
+    else:
+        total_points = 0
+        for idx, q in enumerate(questions):
+            if not q.get("text", "").strip():
+                errors.append(f"Question {idx+1}: text is required")
+            
+            options = q.get("options", [])
+            if len(options) < 2:
+                errors.append(f"Question {idx+1}: at least 2 options required")
+            
+            correct_idx = q.get("correctOptionIndex")
+            if not isinstance(correct_idx, int) or correct_idx < 0 or correct_idx >= len(options):
+                errors.append(f"Question {idx+1}: invalid correctOptionIndex")
+            
+            point = q.get("point", 1)
+            if point <= 0:
+                errors.append(f"Question {idx+1}: point must be positive")
+            total_points += point
+        
+        if abs(total_points - total_marks) > 0.01:
+            errors.append(f"Sum of question points ({total_points}) doesn't match totalMarks ({total_marks})")
+    
+    # Module IDs validation
+    if not module_ids:
+        errors.append("At least one module_id is required")
+    
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors
+    }
 
 # Create MCP server with explicit agent instructions
 mcp = FastMCP("Classroom Quiz Generator MCP Server", instructions=AGENT_INSTRUCTIONS)
@@ -461,92 +531,202 @@ def read_content_file_from_URL(file_url: str, session_id: str) -> str:
 
 
 @mcp.tool()
-def generate_quiz(quiz_details: str, session_id: str) -> str:
+def generate_quiz(
+    title: str,
+    total_marks: float,
+    duration_minutes: int,
+    start_at: str,
+    end_at: str,
+    questions: List[Dict[str, Any]],
+    module_ids: List[str],
+    session_id: str,
+    description: str = ""
+) -> str:
     """
-Persist the validated quiz so it appears in the educator UI.
-
-Flow expectations:
-    1. Finish requirement gathering and run validate_quiz_json.
-    2. As soon as validation returns valid: true, call generate_quiz so the
-       initial draft is stored and rendered. No extra educator approval prompt
-       is required at this moment.
-    3. Capture quiz_id, modules_linked, available_from, and available_until for
-       future revision/announcement steps (never expose IDs to the educator).
-
-When to use:
-    - Immediately after validation passes for a brand-new quiz configuration.
-    - Never for incremental edits (use apply_quiz_revisions in that case).
-
-Input structure:
-    "{
-      "quiz_details": {
-        "title": "...",
-        "description": "...",
-        "totalMarks": 100,
-        "durationMinutes": 90,
-        "startAt": "2024-12-15T09:00:00Z",
-        "endAt": "2024-12-15T12:00:00Z",
-        "module_ids": ["mod_abc", "mod_xyz"],
-        "questions": [
-          {"text": "...", "options": ["A","B","C","D"], "correctOptionIndex": 1, "point": 5},
-          {"text": "...", "options": ["A","B","C","D"], "correctOptionIndex": 2, "point": 5}
+    Create and publish a new quiz to the educator's classroom.
+    
+    Purpose:
+        Persist a validated quiz so it appears immediately in the educator UI.
+        Students can access it once the start_at time arrives.
+    
+    When to use:
+        - After gathering all quiz requirements from the educator
+        - Once you've collected content from module materials
+        - When questions have been crafted and validated
+        - For brand-new quizzes only (use apply_quiz_revisions for edits)
+    
+    Parameters:
+        title: Quiz name shown to students (e.g., "Midterm Exam - OOP")
+        total_marks: Maximum possible score (must equal sum of all question points)
+        duration_minutes: Time limit in minutes (e.g., 60 for 1 hour)
+        start_at: When quiz becomes available (ISO 8601 format: "2024-12-15T09:00:00Z")
+        end_at: When quiz closes (ISO 8601 format: "2024-12-15T18:00:00Z")
+        questions: Array of question objects, each with:
+            - text: Question prompt (string)
+            - options: Answer choices (array of strings, minimum 2)
+            - correctOptionIndex: Index of correct answer (0-based integer)
+            - point: Points awarded for correct answer (positive number)
+        module_ids: Module identifiers from prompt context (array of strings)
+        session_id: Session ID from prompt context for authentication
+        description: Optional context/instructions for students
+    
+    Example questions parameter:
+        [
+            {
+                "text": "What is encapsulation in OOP?",
+                "options": ["Hiding data", "Inheritance", "Polymorphism", "Abstraction"],
+                "correctOptionIndex": 0,
+                "point": 5
+            },
+            {
+                "text": "Which keyword is used for inheritance in Python?",
+                "options": ["extends", "inherits", "class", "implements"],
+                "correctOptionIndex": 2,
+                "point": 5
+            }
         ]
-      },
-      "session_id": "<sessionId from prompt context>"
-    }"
-
-Response format:
-    {
-      "success": true,
-      "quiz_id": "quiz_123",
-      "modules_linked": ["Object-Oriented Programming"],
-      "available_from": "Dec 15, 2024 at 9:00 AM",
-      "available_until": "Dec 15, 2024 at 12:00 PM",
-      "message": "Quiz created successfully"
+    
+    Returns:
+        JSON string with:
+        {
+            "success": true,
+            "quiz_id": "quiz_abc123",
+            "modules_linked": ["Object-Oriented Programming"],
+            "available_from": "Dec 15, 2024 at 9:00 AM",
+            "available_until": "Dec 15, 2024 at 6:00 PM",
+            "message": "Quiz created successfully"
+        }
+    
+    Next steps:
+        1. Store quiz_id internally (never show to educator)
+        2. Summarize: title, duration, marks, availability window, covered topics
+        3. Ask if educator wants to make changes or notify students
+    
+    Validation:
+        - Automatically validates all parameters before API call
+        - Returns validation errors if any constraint is violated
+        - Ensures total_marks equals sum of question points
+        - Checks start_at is before end_at
+    
+    Notes:
+        - Quiz is immediately live; no separate publish step needed
+        - Students see it in their UI once start_at time arrives
+        - Announcement is separate (use add_group_announcement if requested)
+    """
+    # Validate parameters
+    validation = validate_quiz_parameters(
+        title, total_marks, duration_minutes, start_at, end_at, questions, module_ids
+    )
+    
+    if not validation["valid"]:
+        return json.dumps({
+            "success": False,
+            "error": "Validation failed",
+            "details": validation["errors"]
+        })
+    
+    # Build API payload
+    payload = {
+        "quiz_details": {
+            "title": title.strip(),
+            "description": description.strip(),
+            "totalMarks": total_marks,
+            "durationMinutes": duration_minutes,
+            "startAt": start_at,
+            "endAt": end_at,
+            "questions": questions,
+            "module_ids": module_ids
+        }
     }
-
-Next steps when success=true:
-    - Relay human-friendly details (title, duration, marks, availability).
-    - Store quiz_id privately for apply_quiz_revisions.
-    - Ask the educator whether they want more updates or prefer to notify students.
-
-Error handling:
-    - On success=false, explain the high-level cause (date conflict, permissions,
-      backend timeout, etc.) and offer to retry after adjustments.
-    - No quiz is created when the call fails, so it is safe to call again once
-      the issue is resolved.
-"""
+    
     endpoint = "/api/v1/quizzes/from-details"
-    return make_authenticated_request(endpoint, "POST", session_id, json.loads(quiz_details))
+    return make_authenticated_request(endpoint, "POST", session_id, payload)
 
 
 @mcp.tool()
-def apply_quiz_revisions(quiz_id: str, updated_quiz_details: str, session_id: str) -> str:
+def apply_quiz_revisions(
+    quiz_id: str,
+    title: str,
+    total_marks: float,
+    duration_minutes: int,
+    start_at: str,
+    end_at: str,
+    questions: List[Dict[str, Any]],
+    module_ids: List[str],
+    session_id: str,
+    description: str = ""
+) -> str:
     """
-    Apply educator-requested updates to an existing quiz draft.
-
-    Usage:
-        1. Gather the requested changes and rebuild the full quiz JSON.
-        2. Run validate_quiz_json again and ensure it is still valid.
-        3. Call apply_quiz_revisions so the backend/UI reflect the edits.
-
-    Args:
-        quiz_id: Identifier returned from generate_quiz (keep private).
-        updated_quiz_details: Stringified JSON with structure:
-            "{
-              "quiz_details": { ...same schema as generate_quiz... },
-              "session_id": "<sessionId from prompt context>"
-            }"
-        session_id: Session identifier from prompt context for auth.
-
-    Behavior:
-        - Issues a PUT to /api/v1/quizzes/{quiz_id} with the new payload.
-        - Returns { "success": bool, "message": "...", "quiz": {...} } on success.
-        - On failure, includes error/details strings to translate for the educator.
+    Update an existing quiz with educator-requested changes.
+    
+    Purpose:
+        Apply modifications to a previously created quiz (title changes,
+        question edits, timing adjustments, etc.)
+    
+    When to use:
+        - After generate_quiz has been called and quiz_id was returned
+        - When educator requests changes to existing quiz
+        - For iterative refinement of quiz content
+    
+    Parameters:
+        quiz_id: Identifier from generate_quiz response (stored internally, never shown)
+        title: Updated quiz name
+        total_marks: Updated maximum score
+        duration_minutes: Updated time limit
+        start_at: Updated availability start (ISO 8601)
+        end_at: Updated availability end (ISO 8601)
+        questions: Updated complete questions array (same format as generate_quiz)
+        module_ids: Updated module identifiers
+        session_id: Session ID from prompt context
+        description: Updated optional description
+    
+    Returns:
+        JSON string with:
+        {
+            "success": true,
+            "message": "Quiz updated successfully",
+            "quiz": { ...updated quiz object... }
+        }
+    
+    Next steps:
+        1. Confirm changes to educator
+        2. Ask if further revisions needed
+        3. Offer to send announcement if quiz details changed significantly
+    
+    Notes:
+        - Complete replacement: provide ALL fields even if only one changed
+        - Validates parameters same as generate_quiz
+        - Students see updates immediately if quiz is already live
+        - Use same question array structure as generate_quiz
     """
-
+    # Validate parameters
+    validation = validate_quiz_parameters(
+        title, total_marks, duration_minutes, start_at, end_at, questions, module_ids
+    )
+    
+    if not validation["valid"]:
+        return json.dumps({
+            "success": False,
+            "error": "Validation failed",
+            "details": validation["errors"]
+        })
+    
+    # Build API payload
+    payload = {
+        "quiz_details": {
+            "title": title.strip(),
+            "description": description.strip(),
+            "totalMarks": total_marks,
+            "durationMinutes": duration_minutes,
+            "startAt": start_at,
+            "endAt": end_at,
+            "questions": questions,
+            "module_ids": module_ids
+        }
+    }
+    
     endpoint = f"/api/v1/quizzes/from-details/{quiz_id}"
-    return make_authenticated_request(endpoint, "PUT", session_id, json.loads(updated_quiz_details))
+    return make_authenticated_request(endpoint, "PUT", session_id, payload)
 
 
 @mcp.tool()
